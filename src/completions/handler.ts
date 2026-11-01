@@ -9,6 +9,15 @@ const SERVICE_URL = 'api/ai/completion/inline';
 
 type StreamChunk = AiService.InlineCompletionStreamChunk;
 
+type PendingReply = {
+  resolve: (value: AiService.InlineCompletionReply) => void;
+  reject: (reason: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
+const CONNECTION_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 20_000;
+
 export class CompletionWebsocketHandler implements IDisposable {
   /**
    * The server settings used to make API requests.
@@ -39,9 +48,25 @@ export class CompletionWebsocketHandler implements IDisposable {
   public sendMessage(
     message: AiService.InlineCompletionRequest
   ): Promise<AiService.InlineCompletionReply> {
-    return new Promise(resolve => {
-      this._socket?.send(JSON.stringify(message));
-      this._replyForResolver[message.number] = resolve;
+    if (this.isDisposed || !this._socket || this._socket.readyState !== 1) {
+      return Promise.reject(
+        new Error('Inline completion websocket is not connected')
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        delete this._replyForResolver[message.number];
+        reject(new Error('Inline completion request timed out'));
+      }, REQUEST_TIMEOUT_MS);
+      // Register before sending: a fast backend can reply in the next task turn.
+      this._replyForResolver[message.number] = { resolve, reject, timeout };
+      try {
+        this._socket!.send(JSON.stringify(message));
+      } catch (error) {
+        clearTimeout(timeout);
+        delete this._replyForResolver[message.number];
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -68,6 +93,7 @@ export class CompletionWebsocketHandler implements IDisposable {
     }
     this._isDisposed = true;
 
+    this._rejectPending(new Error('Inline completion websocket was disposed'));
     // Clean up socket.
     const socket = this._socket;
     if (socket) {
@@ -91,11 +117,13 @@ export class CompletionWebsocketHandler implements IDisposable {
         break;
       }
       default: {
-        if (message.reply_to in this._replyForResolver) {
-          this._replyForResolver[message.reply_to](message);
+        const pending = this._replyForResolver[message.reply_to];
+        if (pending) {
+          clearTimeout(pending.timeout);
           delete this._replyForResolver[message.reply_to];
+          pending.resolve(message);
         } else {
-          console.warn('Unhandled message', message);
+          console.warn('Unhandled inline completion reply', message);
         }
         break;
       }
@@ -105,21 +133,34 @@ export class CompletionWebsocketHandler implements IDisposable {
   /**
    * Dictionary mapping message IDs to Promise resolvers.
    */
-  private _replyForResolver: Record<
-    number,
-    (value: AiService.InlineCompletionReply) => void
-  > = {};
+  private _replyForResolver: Record<number, PendingReply> = {};
 
   private _onClose(e: CloseEvent, reject: (reason: unknown) => void) {
-    reject(new Error('Inline completion websocket disconnected'));
-    console.error('Inline completion websocket disconnected');
-    // only attempt re-connect if there was an abnormal closure
-    // WebSocket status codes defined in RFC 6455: https://www.rfc-editor.org/rfc/rfc6455.html#section-7.4.1
-    if (e.code === 1006) {
-      const delaySeconds = 1;
-      console.info(`Will try to reconnect in ${delaySeconds} s.`);
-      setTimeout(async () => await this._initialize(), delaySeconds * 1000);
+    const error = new Error('Inline completion websocket disconnected');
+    reject(error);
+    this._rejectPending(error);
+    if (this._isDisposed) {
+      return;
     }
+    // Only attempt reconnect after an abnormal close (RFC 6455 code 1006).
+    if (e.code === 1006) {
+      setTimeout(() => {
+        void this._initialize().catch(reason =>
+          console.error(
+            'Failed to reconnect inline completion websocket.',
+            reason
+          )
+        );
+      }, 1000);
+    }
+  }
+
+  private _rejectPending(error: Error): void {
+    for (const request of Object.values(this._replyForResolver)) {
+      clearTimeout(request.timeout);
+      request.reject(error);
+    }
+    this._replyForResolver = {};
   }
 
   private async _initialize(): Promise<void> {
@@ -128,18 +169,42 @@ export class CompletionWebsocketHandler implements IDisposable {
     }
     const promise = new PromiseDelegate<void>();
     this._initialized = promise;
-    console.log(
-      'Creating a new websocket connection for inline completions...'
-    );
     const { token, WebSocket, wsUrl } = this.serverSettings;
     const url =
       URLExt.join(wsUrl, SERVICE_URL) +
       (token ? `?token=${encodeURIComponent(token)}` : '');
 
     const socket = (this._socket = new WebSocket(url));
+    const timeout = setTimeout(
+      () =>
+        promise.reject(
+          new Error('Inline completion websocket handshake timed out')
+        ),
+      CONNECTION_TIMEOUT_MS
+    );
     socket.onclose = e => this._onClose(e, promise.reject.bind(promise));
-    socket.onerror = e => promise.reject(e);
-    socket.onmessage = msg => msg.data && this._onMessage(JSON.parse(msg.data));
+    socket.onerror = () =>
+      promise.reject(
+        new Error('Inline completion websocket connection failed')
+      );
+    socket.onmessage = msg => {
+      if (!msg.data) {
+        return;
+      }
+      try {
+        this._onMessage(JSON.parse(msg.data));
+      } catch (error) {
+        console.error(
+          'Invalid message from inline completion websocket.',
+          error
+        );
+      }
+    };
+    try {
+      await promise.promise;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private _isDisposed = false;

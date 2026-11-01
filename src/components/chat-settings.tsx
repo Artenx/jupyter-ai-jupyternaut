@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 
 import { Box } from '@mui/system';
+import { Button } from '@mui/material';
 
 import { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 import { IJaiCompletionProvider } from '../tokens';
@@ -22,6 +23,25 @@ type ChatSettingsProps = {
  * *custom models* that populate that picker, plus manage secrets/API keys.
  */
 export function ChatSettings(props: ChatSettingsProps): JSX.Element {
+  const [inlineCompletionsEnabled, setInlineCompletionsEnabled] = useState(
+    props.completionProvider?.isEnabled() ?? false
+  );
+
+  useEffect(() => {
+    const provider = props.completionProvider;
+    if (!provider) {
+      setInlineCompletionsEnabled(false);
+      return;
+    }
+    const updateEnabled = () =>
+      setInlineCompletionsEnabled(provider.isEnabled());
+    provider.settingsChanged.connect(updateEnabled);
+    updateEnabled();
+    return () => {
+      provider.settingsChanged.disconnect(updateEnabled);
+    };
+  }, [props.completionProvider]);
+
   return (
     <Box
       className="jp-ai-ChatSettings"
@@ -52,6 +72,34 @@ export function ChatSettings(props: ChatSettingsProps): JSX.Element {
         .
       </p>
       <CustomModelsInput />
+
+      {/* SECTION: Inline code completions */}
+      <h2 className="jp-ai-ChatSettings-header">Inline code completions</h2>
+      {props.completionProvider ? (
+        <>
+          <p>
+            Jupyter AI can suggest code at the cursor. Press Tab to accept a
+            suggestion. To improve data-science completions, the active kernel's
+            variable names/types and DataFrame schema plus nearby CSV/Excel file
+            names may be sent to your configured model; row samples and file
+            contents are not sent. Current status:{' '}
+            <strong>{inlineCompletionsEnabled ? 'enabled' : 'disabled'}</strong>
+            .
+          </p>
+          <Button
+            variant="outlined"
+            onClick={props.openInlineCompleterSettings}
+            sx={{ marginBottom: 2 }}
+          >
+            Configure inline completion settings
+          </Button>
+        </>
+      ) : (
+        <p>
+          Inline completion is unavailable in this JupyterLab version.
+          JupyterLab 4.1 or newer is required.
+        </p>
+      )}
 
       {/* SECTION: Secrets (and API keys) */}
       <h2 className="jp-ai-ChatSettings-header">Secrets and API keys</h2>

@@ -436,6 +436,13 @@ class ConfigManager(Configurable):
         return config.completions_model_provider_id
 
     @property
-    def completion_model_params(self):
-        # TODO
-        return {}
+    def completion_model_params(self) -> dict[str, Any]:
+        """Return parameters for the configured completions model."""
+        config = self._read_config()
+        model_id = config.completions_model_provider_id
+        if not model_id:
+            return {}
+        custom_model = self.get_custom_model(model_id)
+        if custom_model is not None:
+            return dict(custom_model.params)
+        return dict(config.completions_fields.get(model_id, {}))

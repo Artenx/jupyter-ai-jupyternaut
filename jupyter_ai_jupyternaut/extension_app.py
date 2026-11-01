@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from .config import ConfigManager, ConfigRestAPI
 from .handlers import RouteHandler
+from .completions.inline_websocket import InlineCompletionWebSocketHandler
 from .jupyternaut import JupyternautPersona
 from .models import LiteLLMModelsRestAPI, ModelParametersRestAPI
 from .secrets import EnvSecretsManager, SecretsRestAPI
@@ -36,6 +37,7 @@ class JupyternautExtension(ExtensionApp):
         (r"api/jupyternaut/model-parameters/?", ModelParametersRestAPI),
         (r"api/jupyternaut/litellm-models/?", LiteLLMModelsRestAPI),
         (r"api/jupyternaut/secrets/?", SecretsRestAPI),
+        (r"api/ai/completion/inline/?", InlineCompletionWebSocketHandler),
     ]
 
     allowed_providers = List(

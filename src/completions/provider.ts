@@ -1,25 +1,25 @@
-import {
-  InlineCompletionTriggerKind,
+import { InlineCompletionTriggerKind } from '@jupyterlab/completer';
+import type {
   IInlineCompletionProvider,
   IInlineCompletionContext,
   IInlineCompletionList,
   IInlineCompletionItem,
   CompletionHandler
 } from '@jupyterlab/completer';
-import { ISettingRegistry } from '@jupyterlab/settingregistry';
+import type { ISettingRegistry } from '@jupyterlab/settingregistry';
 import { Notification, showErrorMessage } from '@jupyterlab/apputils';
-import { JSONValue, PromiseDelegate } from '@lumino/coreutils';
-import { ISignal, Signal } from '@lumino/signaling';
-import {
+import { PromiseDelegate, type JSONValue } from '@lumino/coreutils';
+import { Signal, type ISignal } from '@lumino/signaling';
+import type {
   IEditorLanguageRegistry,
   IEditorLanguage
 } from '@jupyterlab/codemirror';
 import { NotebookPanel } from '@jupyterlab/notebook';
 import { IJaiCompletionProvider } from '../tokens';
 import { AiCompleterService as AiService } from './types';
-import { DocumentWidget } from '@jupyterlab/docregistry';
 import { jupyternautIcon } from '../icons';
-import { CompletionWebsocketHandler } from './handler';
+import type { CompletionWebsocketHandler } from './handler';
+import type { JaiCompletionContextManager } from './context-manager';
 
 type StreamChunk = AiService.InlineCompletionStreamChunk;
 
@@ -54,6 +54,9 @@ export class JaiInlineProvider
     request: CompletionHandler.IRequest,
     context: IInlineCompletionContext
   ): Promise<IInlineCompletionList<IInlineCompletionItem>> {
+    if (!this.isEnabled()) {
+      return { items: [] };
+    }
     const allowedTriggerKind = this._settings.triggerKind;
     const triggerKind = context.triggerKind;
     if (
@@ -77,18 +80,13 @@ export class JaiInlineProvider
       // Do not offer suggestions if disabled.
       return { items: [] };
     }
-    let cellId = undefined;
-    let path = context.session?.path;
-    if (context.widget instanceof NotebookPanel) {
-      const activeCell = context.widget.content.activeCell;
-      if (activeCell) {
-        cellId = activeCell.model.id;
-      }
-    }
-    if (!path && context.widget instanceof DocumentWidget) {
-      path = context.widget.context.path;
-    }
+    const notebookContext =
+      context.widget instanceof NotebookPanel
+        ? this.options.contextManager.getNotebookContext(context.widget.id)
+        : undefined;
+    this._resetStreams();
     const number = ++this._counter;
+    this._latestRequestNumber = number;
 
     const streamPreference = this._settings.streaming;
     const stream =
@@ -98,43 +96,49 @@ export class JaiInlineProvider
           ? false
           : context.triggerKind === InlineCompletionTriggerKind.Invoke;
 
-    if (stream) {
-      // Reset stream promises handler
-      this._streamPromises.clear();
+    let result: AiService.InlineCompletionReply;
+    try {
+      result = await this.options.completionHandler.sendMessage({
+        mime,
+        prefix: this._prefixFromRequest(request),
+        suffix: this._suffixFromRequest(request),
+        language: this._resolveLanguage(language),
+        number,
+        stream,
+        variables: notebookContext?.variables ?? [],
+        files: notebookContext?.files ?? []
+      });
+    } catch (reason) {
+      console.warn('Jupyter AI inline completion request failed.', reason);
+      return { items: [] };
     }
-    const result = await this.options.completionHandler.sendMessage({
-      path,
-      mime,
-      prefix: this._prefixFromRequest(request),
-      suffix: this._suffixFromRequest(request),
-      language: this._resolveLanguage(language),
-      number,
-      stream,
-      cell_id: cellId
-    });
+
+    if (number !== this._latestRequestNumber) {
+      return { items: [] };
+    }
 
     const error = result.error;
     if (error) {
-      Notification.emit(`Inline completion failed: ${error.type}`, 'error', {
-        autoClose: false,
-        actions: [
-          {
-            label: 'Show Traceback',
-            callback: () => {
-              showErrorMessage('Inline completion failed on the server side', {
-                message: `${error.title}\n${error.traceback}`
-              });
+      if (!this._reportedErrors.has(error.type)) {
+        Notification.emit(`Inline completion failed: ${error.type}`, 'error', {
+          autoClose: false,
+          actions: [
+            {
+              label: 'Show Traceback',
+              callback: () => {
+                showErrorMessage(
+                  'Inline completion failed on the server side',
+                  {
+                    message: `${error.title}\n${error.traceback}`
+                  }
+                );
+              }
             }
-          }
-        ]
-      });
-      const items = [
-        {
-          error: { message: error.title },
-          insertText: ''
-        }
-      ];
-      return { items };
+          ]
+        });
+        this._reportedErrors.add(error.type);
+      }
+      return { items: [] };
     }
     return result.list;
   }
@@ -145,12 +149,24 @@ export class JaiInlineProvider
   async *stream(token: string): AsyncGenerator<StreamChunk, void, unknown> {
     let done = false;
     while (!done) {
+      const buffered = this._bufferedStreamChunks.get(token);
+      if (buffered?.length) {
+        const chunk = buffered.shift()!;
+        if (buffered.length === 0) {
+          this._bufferedStreamChunks.delete(token);
+        }
+        yield chunk;
+        done = chunk.done;
+        continue;
+      }
       const delegate = new PromiseDelegate<StreamChunk>();
       this._streamPromises.set(token, delegate);
-      const promise = delegate.promise;
-      yield promise;
-      done = (await promise).done;
+      const chunk = await delegate.promise;
+      this._streamPromises.delete(token);
+      yield chunk;
+      done = chunk.done;
     }
+    this._bufferedStreamChunks.delete(token);
   }
 
   get schema(): ISettingRegistry.IProperty {
@@ -234,16 +250,21 @@ export class JaiInlineProvider
   ) {
     const token = chunk.response.token;
     if (!token) {
-      throw Error('Stream chunks must return define `token` in `response`');
+      throw Error('Stream chunks must define `token` in `response`');
+    }
+    if (chunk.reply_to !== this._latestRequestNumber) {
+      return;
     }
     const delegate = this._streamPromises.get(token);
-    if (!delegate) {
-      console.warn('Unhandled stream chunk');
-    } else {
+    if (delegate) {
+      this._streamPromises.delete(token);
       delegate.resolve(chunk);
-      if (chunk.done) {
-        this._streamPromises.delete(token);
-      }
+    } else {
+      // The backend may start streaming immediately after the acknowledgement
+      // reply, before the completion manager asks us to open this stream.
+      const buffered = this._bufferedStreamChunks.get(token) ?? [];
+      buffered.push(chunk);
+      this._bufferedStreamChunks.set(token, buffered);
     }
   }
 
@@ -263,11 +284,11 @@ export class JaiInlineProvider
    */
   private _suffixFromRequest(request: CompletionHandler.IRequest): string {
     const textAfter = request.text.slice(request.offset);
-    const prefix = textAfter.slice(
+    const suffix = textAfter.slice(
       0,
-      Math.min(this._settings.maxPrefix, textAfter.length)
+      Math.min(this._settings.maxSuffix, textAfter.length)
     );
-    return prefix;
+    return suffix;
   }
 
   private _resolveLanguage(language: IEditorLanguage | null) {
@@ -286,9 +307,25 @@ export class JaiInlineProvider
     JaiInlineProvider.DEFAULT_SETTINGS;
   private _settingsChanged = new Signal<JaiInlineProvider, void>(this);
 
+  private _resetStreams(): void {
+    for (const [token, delegate] of this._streamPromises) {
+      delegate.resolve({
+        type: 'stream',
+        reply_to: this._latestRequestNumber,
+        response: { token, insertText: '', isIncomplete: false },
+        done: true
+      });
+    }
+    this._streamPromises.clear();
+    this._bufferedStreamChunks.clear();
+  }
+
   private _streamPromises: Map<string, PromiseDelegate<StreamChunk>> =
     new Map();
+  private _bufferedStreamChunks = new Map<string, StreamChunk[]>();
+  private _reportedErrors = new Set<string>();
   private _counter = 0;
+  private _latestRequestNumber = 0;
 }
 
 export namespace JaiInlineProvider {
@@ -297,6 +334,7 @@ export namespace JaiInlineProvider {
   export interface IOptions {
     completionHandler: CompletionWebsocketHandler;
     languageRegistry: IEditorLanguageRegistry;
+    contextManager: JaiCompletionContextManager;
   }
 
   export interface ISettings {

@@ -2,8 +2,10 @@ import {
   JupyterFrontEnd,
   JupyterFrontEndPlugin
 } from '@jupyterlab/application';
+import { Notification } from '@jupyterlab/apputils';
 import { ICompletionProviderManager } from '@jupyterlab/completer';
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
+import { INotebookTracker } from '@jupyterlab/notebook';
 import {
   IEditorLanguageRegistry,
   IEditorLanguage
@@ -12,6 +14,8 @@ import { getEditor } from '../utils';
 import { IJaiStatusItem, IJaiCompletionProvider } from '../tokens';
 import { displayName, JaiInlineProvider } from './provider';
 import { CompletionWebsocketHandler } from './handler';
+import { JaiCompletionContextManager } from './context-manager';
+import { AiService } from '../handler';
 
 export namespace CommandIDs {
   /**
@@ -54,16 +58,18 @@ export const completionPlugin: JupyterFrontEndPlugin<JaiCompletionToken> = {
   requires: [
     ICompletionProviderManager,
     IEditorLanguageRegistry,
-    ISettingRegistry
+    ISettingRegistry,
+    INotebookTracker,
+    IJaiStatusItem
   ],
-  optional: [IJaiStatusItem],
   provides: IJaiCompletionProvider,
   activate: async (
     app: JupyterFrontEnd,
     completionManager: ICompletionProviderManager,
     languageRegistry: IEditorLanguageRegistry,
     settingRegistry: ISettingRegistry,
-    statusItem: IJaiStatusItem | null
+    notebookTracker: INotebookTracker,
+    statusItem: IJaiStatusItem
   ): Promise<JaiCompletionToken> => {
     if (typeof completionManager.registerInlineProvider === 'undefined') {
       // Gracefully short-circuit on JupyterLab 4.0 and Notebook 7.0
@@ -74,12 +80,26 @@ export const completionPlugin: JupyterFrontEndPlugin<JaiCompletionToken> = {
     }
 
     const completionHandler = new CompletionWebsocketHandler();
+    const contextManager = new JaiCompletionContextManager(
+      app,
+      notebookTracker
+    );
     const provider = new JaiInlineProvider({
       completionHandler,
-      languageRegistry
+      languageRegistry,
+      contextManager
     });
 
-    await completionHandler.initialize();
+    try {
+      await completionHandler.initialize();
+    } catch (reason) {
+      // Keep JupyterLab usable if the optional server-side completion endpoint
+      // is unavailable. The client will reconnect after an abnormal close.
+      console.warn(
+        'Jupyter AI inline completion endpoint is unavailable.',
+        reason
+      );
+    }
     completionManager.registerInlineProvider(provider);
 
     const findCurrentLanguage = (): IEditorLanguage | null => {
@@ -129,6 +149,54 @@ export const completionPlugin: JupyterFrontEndPlugin<JaiCompletionToken> = {
       icSettings.set('providers', newUserIcpSettings);
     }
 
+    // Mito's first-run flow enables its provider once, while leaving an
+    // explicit user choice untouched. Jupyter AI follows the same interaction
+    // but keeps JupyterLab's history provider available alongside it.
+    const enableOnFirstInstall = async (): Promise<void> => {
+      try {
+        const settings = await getIcSettings();
+        const userProvider = settings.user.providers?.[JaiInlineProvider.ID] as
+          | Partial<JaiInlineProvider.ISettings>
+          | undefined;
+        if (typeof userProvider?.enabled === 'boolean') {
+          return;
+        }
+        const config = await AiService.getConfig();
+        const modelAvailable = Boolean(
+          config.completions_model_provider_id ||
+            config.model_provider_id ||
+            config.custom_models?.length
+        );
+        if (modelAvailable) {
+          await updateJaiIcpSettings({ enabled: true });
+
+          Notification.info(
+            'Jupyter AI code completion is enabled. Press Tab to accept a suggestion; manage triggers in JupyterLab Settings.',
+            { autoClose: 8000 }
+          );
+        }
+      } catch (reason) {
+        // The status-bar command and Settings editor remain available if the
+        // settings or server config endpoint cannot be read during startup.
+        console.warn(
+          'Could not initialize Jupyter AI inline completion settings.',
+          reason
+        );
+      }
+    };
+    // The core completer-extension plugin registers its settings transformer
+    // for the inline completer inside `app.restored`, so loading the plugin
+    // settings during startup would always fail with "has no transformers
+    // yet". Wait for `app.restored` before the first-install enablement.
+    void app.restored
+      .then(() => enableOnFirstInstall())
+      .catch((reason: unknown) => {
+        console.warn(
+          'Could not run the Jupyter AI inline completion first-install setup.',
+          reason
+        );
+      });
+
     app.commands.addCommand(CommandIDs.toggleCompletions, {
       execute: async () => {
         const jaiIcpSettings = await getJaiIcpSettings();
@@ -136,7 +204,10 @@ export const completionPlugin: JupyterFrontEndPlugin<JaiCompletionToken> = {
           enabled: !jaiIcpSettings.enabled
         });
       },
-      label: 'Enable completions by Jupyternaut',
+      label: () =>
+        provider.isEnabled()
+          ? 'Disable code completions by Jupyternaut'
+          : 'Enable code completions by Jupyternaut',
       isToggled: () => {
         return provider.isEnabled();
       }
@@ -179,16 +250,14 @@ export const completionPlugin: JupyterFrontEndPlugin<JaiCompletionToken> = {
       }
     });
 
-    if (statusItem) {
-      statusItem.addItem({
-        command: CommandIDs.toggleCompletions,
-        rank: 1
-      });
-      statusItem.addItem({
-        command: CommandIDs.toggleLanguageCompletions,
-        rank: 2
-      });
-    }
+    statusItem.addItem({
+      command: CommandIDs.toggleCompletions,
+      rank: 1
+    });
+    statusItem.addItem({
+      command: CommandIDs.toggleLanguageCompletions,
+      rank: 2
+    });
     return provider;
   }
 };

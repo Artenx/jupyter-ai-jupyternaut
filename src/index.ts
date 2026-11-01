@@ -16,7 +16,7 @@ import { SingletonLayout, Widget } from '@lumino/widgets';
 
 import { IPersonaControlRegistry } from '@jupyter-ai/persona-manager';
 
-//import { completionPlugin } from './completions';
+import { completionPlugin } from './completions';
 import { buildErrorWidget } from './widgets/chat-error';
 import { buildAiSettings } from './widgets/settings-widget';
 import { statusItemPlugin } from './status';
@@ -66,19 +66,14 @@ const plugin: JupyterFrontEndPlugin<void> = {
 const jupyternautSettingsPlugin: JupyterFrontEndPlugin<void> = {
   id: '@jupyter-ai/jupyternaut:settings',
   autoStart: true,
-  requires: [IRenderMimeRegistry],
-  optional: [
-    ICommandPalette,
-    IThemeManager,
-    IJaiCompletionProvider,
-    INotebookShell
-  ],
+  requires: [IRenderMimeRegistry, IJaiCompletionProvider],
+  optional: [ICommandPalette, IThemeManager, INotebookShell],
   activate: async (
     app: JupyterFrontEnd,
     rmRegistry: IRenderMimeRegistry,
+    completionProvider: IJaiCompletionProvider | null,
     palette: ICommandPalette | null,
     themeManager: IThemeManager | null,
-    completionProvider: IJaiCompletionProvider | null,
     notebookShell: INotebookShell | null
   ) => {
     const openInlineCompleterSettings = () => {
@@ -161,9 +156,8 @@ const settingsButtonPlugin: JupyterFrontEndPlugin<void> = {
 
 export default [
   plugin,
+  statusItemPlugin,
+  completionPlugin,
   jupyternautSettingsPlugin,
-  settingsButtonPlugin,
-  // webComponentsPlugin,
-  // completionPlugin,
-  statusItemPlugin
+  settingsButtonPlugin
 ];

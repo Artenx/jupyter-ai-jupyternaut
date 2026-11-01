@@ -114,6 +114,43 @@ def test_get_config_includes_custom_models(config_path):
     assert [m.name for m in cm.get_config().custom_models] == ["A"]
 
 
+def test_completion_model_params_resolve_custom_model(config_path):
+    _write_config(config_path, {})
+    cm = _manager(config_path)
+    completion_model = CustomModel(
+        name="Inline",
+        model_id="openai/inline-model",
+        params={"temperature": 0.0, "max_tokens": 96},
+    )
+    cm.update_config(
+        UpdateConfigRequest(
+            custom_models=[completion_model],
+            completions_model_provider_id=completion_model.id,
+        )
+    )
+
+    assert cm.completion_model == completion_model.id
+    assert cm.completion_model_params == {
+        "temperature": 0.0,
+        "max_tokens": 96,
+    }
+
+
+def test_completion_model_params_read_provider_fields(config_path):
+    _write_config(
+        config_path,
+        {
+            "completions_model_provider_id": "openai/inline-model",
+            "completions_fields": {
+                "openai/inline-model": {"temperature": 0.0, "max_tokens": 64}
+            },
+        },
+    )
+    cm = _manager(config_path)
+
+    assert cm.completion_model_params == {"temperature": 0.0, "max_tokens": 64}
+
+
 # ---------------------------------------------------------------------------
 # Persona model configuration & resolution
 # ---------------------------------------------------------------------------

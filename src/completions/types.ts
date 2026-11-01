@@ -18,6 +18,14 @@ export namespace AiCompleterService {
     client_id: string;
   };
 
+  export type RuntimeVariable = {
+    name: string;
+    type: string;
+    shape?: number[];
+    columns?: string[];
+    dtypes?: Record<string, string>;
+  };
+
   export type InlineCompletionRequest = {
     number: number;
     path?: string;
@@ -30,6 +38,10 @@ export namespace AiCompleterService {
     stream: boolean;
     language?: string;
     cell_id?: string;
+    /** Cached kernel metadata; never include arbitrary variable values. */
+    variables?: RuntimeVariable[];
+    /** Names of nearby supported data files (never file contents). */
+    files?: string[];
   };
 
   export type CompletionError = {
