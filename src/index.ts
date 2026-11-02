@@ -154,10 +154,34 @@ const settingsButtonPlugin: JupyterFrontEndPlugin<void> = {
   }
 };
 
+/**
+ * Plugin that hides Mito's three AI upsell buttons ("Suggest Graphs",
+ * "AI Alerts", "AI Chat") in the mitosheet toolbar. Mito's AI backend
+ * (mito-ai) is not deployed in this environment, so the buttons are
+ * non-functional; hiding them avoids user confusion. If mito-ai or an
+ * equivalent bridge is deployed later, remove this plugin to bring the
+ * buttons back.
+ */
+const hideMitoAiButtonsPlugin: JupyterFrontEndPlugin<void> = {
+  id: '@jupyter-ai/jupyternaut:hide-mito-ai-buttons',
+  autoStart: true,
+  activate: (app: JupyterFrontEnd) => {
+    const style = document.createElement('style');
+    style.id = 'jai-hide-mito-ai-buttons';
+    style.textContent = [
+      '.mito-toolbar-tabbar-right .mito-plan-button {',
+      '  display: none !important;',
+      '}'
+    ].join('\n');
+    document.head.appendChild(style);
+  }
+};
+
 export default [
   plugin,
   statusItemPlugin,
   completionPlugin,
   jupyternautSettingsPlugin,
-  settingsButtonPlugin
+  settingsButtonPlugin,
+  hideMitoAiButtonsPlugin
 ];
