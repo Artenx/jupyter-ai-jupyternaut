@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Any
 
@@ -104,6 +105,11 @@ class JupyternautPersona(BasePersona):
     """
     The Jupyternaut persona, the main persona provided by Jupyter AI.
     """
+
+    # Task running `stream_message` for the in-flight reply, set in
+    # `process_message` and cancelled by `cancel_response` when the user
+    # stops the response. `None` when idle.
+    _response_task: asyncio.Task | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -440,10 +446,32 @@ class JupyternautPersona(BasePersona):
                         emitted += text
 
             response_aiter = create_aiter()
-            await self.stream_message(response_aiter)
+            # Run the streaming in a tracked task so `cancel_response` can
+            # interrupt it when the user presses the stop button. Swallowing
+            # the CancelledError here (rather than letting it escape) ends
+            # this turn cleanly: `stream_message` already clears the writing
+            # status when it unwinds, and `track_processing` resets the
+            # processing flag in `on_message` once this returns.
+            self._response_task = asyncio.create_task(
+                self.stream_message(response_aiter)
+            )
+            try:
+                await self._response_task
+            except asyncio.CancelledError:
+                return
+            finally:
+                self._response_task = None
         except Exception as e:
             self.log.exception("Error while processing message.")
             self.send_message(f"Error: {e}")
+
+    async def cancel_response(self) -> None:
+        """
+        Interrupt the in-flight model stream when the user stops the response.
+        """
+        task = self._response_task
+        if task is not None and not task.done():
+            task.cancel()
 
     def get_system_prompt(
         self, model_id: str, message: Message
