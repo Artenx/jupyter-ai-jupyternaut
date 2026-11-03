@@ -230,15 +230,25 @@ export const completionPlugin: JupyterFrontEndPlugin<JaiCompletionToken> = {
           disabledLanguages: newDisabledLanguages
         });
       },
+      // The label states the action, flipping like the global toggle's does,
+      // so a checked item never shows an action it would not perform.
       label: () => {
         const language = findCurrentLanguage();
-        return language
+        if (!language) {
+          return 'Disable completions in <language> files';
+        }
+        return provider.isLanguageEnabled(language.name)
           ? `Disable completions in ${displayName(language)}`
-          : 'Disable completions in <language> files';
+          : `Enable completions in ${displayName(language)}`;
       },
+      // Same convention as the global toggle above: the checkmark means
+      // "AI completions are currently ENABLED for this language", and the
+      // label below is the action clicking performs. The previous semantics
+      // (checkmark = language is in the disabled list) inverted the meaning
+      // of the checkmark relative to the first menu item.
       isToggled: () => {
         const language = findCurrentLanguage();
-        return !!language && !provider.isLanguageEnabled(language.name);
+        return !!language && provider.isLanguageEnabled(language.name);
       },
       isVisible: () => {
         const language = findCurrentLanguage();
